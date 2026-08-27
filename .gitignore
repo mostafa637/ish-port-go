@@ -1,0 +1,13 @@
+# Generated/build output
+/build/
+/build-*/
+*.log
+
+# Local guest filesystem and packaged archives
+testdata/alpine-x86/
+testdata/*.tar.gz
+
+# Temporary probes and local scratch files
+**/tmp_*.go
+*.tmp
+.DS_Store
