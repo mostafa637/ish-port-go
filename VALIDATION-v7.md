@@ -87,3 +87,19 @@ go vet ./...
 كشف GDB أن ishrun non-interactive كان يراكم output داخل PTY ولا يضخه إلى stdout؛ أُصلح ذلك وأثبت `busybox echo gdb-parity` تطابق النص والـexit behavior مع المرجع الأصلي.
 
 أعيد التحقق بعد v7: `go test ./...` و`go test -race ./...` و`go vet ./...` ومصفوفة BusyBox المصححة 34/34 حالة. تقرير GDB وscripts المقارنة مرفقة داخل المصدر باسم `gdb-comparison-v3.md` و`gdb-original.cmd` و`gdb-go.cmd`.
+
+
+## الجولة التالية: pipe وshell pipeline
+
+أضيفت `pipe(2)` برقم 42 و`pipe2(2)` برقم 331 داخل kernel Pure Go. الـendpoints تشترك في buffer محدود، وتدعم read/write وEOF و`EPIPE` و`O_NONBLOCK`/`EAGAIN`، مع reference counts مستقلة عند `dup2` وfork. أضيفت readiness وHUP الأساسيان إلى `poll`، وأضيف close-on-exit لتحرير descriptors المتبقية عند انتهاء guest.
+
+أضيف نموذج blocked IO للـpipe عند تشغيل Scheduler، كما أصبح blocking `wait4` يسجل حالة parent ويستأنفها بعد خروج child. أُضيف اختبار kernel للإنشاء والقراءة والكتابة وEOF وnonblocking وpoll وdup2 وrollback، واختبار تكامل يشغل `busybox sh -c 'echo pipe-ok | wc -c'` ويثبت exit code صفرًا ومخرج `8`.
+
+تم تحديث `ishrun` ليستخدم Scheduler في الوضعين التفاعلي وغير التفاعلي، ثم أثبت CLI pipeline نفسه. مصفوفة BusyBox أصبحت 35 حالة محددة، ونجحت `0/35` بعد إضافة حالة pipeline.
+
+هذه ليست دلالة على shell POSIX كامل: تسليم `SIGPIPE` التلقائي، blocking poll المتكامل للـpipes، تطبيق `O_CLOEXEC` أثناء exec، وshared-thread pipe wait queues ما زالت غير مكتملة.
+
+
+## ملاحظة موارد الاختبار
+
+نجحت `GOMAXPROCS=2 go test -race ./...` بعد عزل اختبار guest pipeline الثقيل في `internal/runtime/pipeline_test.go` بوسم `//go:build !race`؛ تشغيل نفس الاختبار العادي وCLI matrix pipeline نجحا منفصلين. هذا إجراء موارد مقصود لأن fork-style guest ينسخ CPU وAddressSpace، وrace instrumentation يرفع استهلاك الذاكرة، وليس تجاهلًا لفشل اختبار. يجب عند تفسير نتائج race التفريق بين suite race الكاملة واختبار pipeline التشغيلي المنفصل.

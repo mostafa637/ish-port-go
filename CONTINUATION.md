@@ -118,3 +118,12 @@ go build -trimpath -o ./ishrun ./cmd/ishrun
 تتضمن جولة v7 page-protection enforcement المرتبط بـ`AddressSpace`، و`Fetch8` للـexecute permission، وإصلاح stdout في ishrun الذي كشفته مقارنة GDB. بُني iSH الأصلي CLI وishrun Go مع debug symbols، وشُغّل GDB على الاثنين في `busybox true` و`busybox echo gdb-parity`؛ التقرير `gdb-comparison-v3.md` يثبت guest exit/normal exit وstdout parity المحدود، ولا يدعي instruction equivalence كاملًا.
 
 نجحت بعد ذلك `go test ./...` و`go test -race ./...` و`go vet ./...` ومصفوفة BusyBox 34/34، مع عدم وجود `tmp_*.go`. حزمة v7 النهائية هي source منفصل عن rootfs: source SHA-256 سيُثبت في الملف الخارجي `ish-port-go-v7-source.tar.gz.sha256`، وrootfs SHA-256 `e1945f6e4192da590eb99f541270396efd430042a50a30b39070ea2d30c86248`. يجب عدم اعتبار archive v6 current بعد هذه الجولة.
+
+
+## الجولة الحالية: pipes وshell pipelines
+
+أضيفت `pipe(2)`/`pipe2(2)` برقمَي 42 و331 مع buffer Pure Go مشترك، EOF، `EPIPE`، `O_NONBLOCK`/`EAGAIN`، readiness/HUP أساسيين، وdup/fork reference counts. أضيف blocked pipe IO إلى Scheduler، وأضيف blocked `wait4` كي لا يخرج shell بـ255 عند انتظار child، مع close-on-exit لإغلاق descriptors المتبقية.
+
+بعد إصلاح fork endpoint sharing وتوصيل `ishrun` إلى Scheduler، نجح `busybox sh -c 'echo pipe-ok | wc -c'` عبر CLI وSession: exit code=0 وoutput=`8`. أضيفت الحالة إلى `scripts/busybox_matrix.sh` بترميز `__PIPE__` لتجنب تعارض separator، فأصبحت المصفوفة 35 حالة ونجحت 0/35.
+
+توجد اختبارات kernel للـpipe lifecycle وnonblocking وpoll وdup2 وrollback، واختبار runtime pipeline. ما يزال SIGPIPE التلقائي، blocking poll الكامل للpipe، O_CLOEXEC عبر exec، وCLONE_VM/CLONE_THREAD خارج التنفيذ الكامل.

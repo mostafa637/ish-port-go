@@ -397,3 +397,220 @@ func TestReadvSplitsFileAcrossIovecs(t *testing.T) {
 		t.Fatalf("iovecs=%q+%q", first, second)
 	}
 }
+
+func TestPipeReadWriteEOF(t *testing.T) {
+	mem := i386.NewMemory(16 * 1024)
+	cpu := i386.NewCPU(mem)
+	k := New(nil, pty.New())
+	cpu.Regs[i386.EAX] = SysPipe
+	cpu.Regs[i386.EBX] = 100
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	if got := int32(cpu.Regs[i386.EAX]); got != 0 {
+		t.Fatalf("pipe=%d", got)
+	}
+	readFD, err := mem.Read32(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFD, err := mem.Read32(104)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readFD == writeFD {
+		t.Fatal("pipe returned identical descriptors")
+	}
+	if err := mem.WriteBytes(200, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	cpu.Regs[i386.EAX] = SysWrite
+	cpu.Regs[i386.EBX] = writeFD
+	cpu.Regs[i386.ECX] = 200
+	cpu.Regs[i386.EDX] = 5
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 5 {
+		t.Fatalf("pipe write=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	cpu.Regs[i386.EAX] = SysRead
+	cpu.Regs[i386.EBX] = readFD
+	cpu.Regs[i386.ECX] = 300
+	cpu.Regs[i386.EDX] = 5
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 5 {
+		t.Fatalf("pipe read=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	data, err := mem.ReadBytes(300, 5)
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("pipe data=(%q,%v)", data, err)
+	}
+	cpu.Regs[i386.EAX] = SysClose
+	cpu.Regs[i386.EBX] = writeFD
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 0 {
+		t.Fatalf("close writer=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+	cpu.Regs[i386.EAX] = SysRead
+	cpu.Regs[i386.EBX] = readFD
+	cpu.Regs[i386.ECX] = 300
+	cpu.Regs[i386.EDX] = 5
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 0 {
+		t.Fatalf("pipe eof=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+}
+
+func TestPipe2NonblockAndInvalidFlags(t *testing.T) {
+	mem := i386.NewMemory(16 * 1024)
+	cpu := i386.NewCPU(mem)
+	k := New(nil, pty.New())
+	cpu.Regs[i386.EAX] = SysPipe2
+	cpu.Regs[i386.EBX] = 100
+	cpu.Regs[i386.ECX] = 0x800 // O_NONBLOCK
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 0 {
+		t.Fatalf("pipe2 nonblock=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	readFD, _ := mem.Read32(100)
+	cpu.Regs[i386.EAX] = SysRead
+	cpu.Regs[i386.EBX] = readFD
+	cpu.Regs[i386.ECX] = 200
+	cpu.Regs[i386.EDX] = 1
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != -ErrnoAgain {
+		t.Fatalf("nonblock read=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	cpu.Regs[i386.EAX] = SysPipe2
+	cpu.Regs[i386.EBX] = 100
+	cpu.Regs[i386.ECX] = 1
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != -ErrnoInvalid {
+		t.Fatalf("invalid pipe2 flags=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+}
+
+func TestPipePollReadinessAndHangup(t *testing.T) {
+	mem := i386.NewMemory(16 * 1024)
+	cpu := i386.NewCPU(mem)
+	k := New(nil, pty.New())
+	cpu.Regs[i386.EAX] = SysPipe
+	cpu.Regs[i386.EBX] = 100
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	readFD, _ := mem.Read32(100)
+	writeFD, _ := mem.Read32(104)
+	if err := mem.Write32(400, readFD); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Write16(404, 1); err != nil {
+		t.Fatal(err)
+	}
+	cpu.Regs[i386.EAX] = SysPoll
+	cpu.Regs[i386.EBX] = 400
+	cpu.Regs[i386.ECX] = 1
+	cpu.Regs[i386.EDX] = 0
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 0 {
+		t.Fatalf("empty poll=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+	if revents, _ := mem.Read16(406); revents != 0 {
+		t.Fatalf("empty revents=0x%x", revents)
+	}
+	if err := mem.WriteBytes(200, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	cpu.Regs[i386.EAX] = SysWrite
+	cpu.Regs[i386.EBX] = writeFD
+	cpu.Regs[i386.ECX] = 200
+	cpu.Regs[i386.EDX] = 1
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 1 {
+		t.Fatalf("poll write=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+	cpu.Regs[i386.EAX] = SysPoll
+	cpu.Regs[i386.EBX] = 400
+	cpu.Regs[i386.ECX] = 1
+	cpu.Regs[i386.EDX] = 0
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 1 {
+		t.Fatalf("ready poll=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+
+	if revents, _ := mem.Read16(406); revents&1 == 0 {
+		t.Fatalf("ready revents=0x%x", revents)
+	}
+	cpu.Regs[i386.EAX] = SysClose
+	cpu.Regs[i386.EBX] = writeFD
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	cpu.Regs[i386.EAX] = SysRead
+	cpu.Regs[i386.EBX] = readFD
+	cpu.Regs[i386.ECX] = 300
+	cpu.Regs[i386.EDX] = 1
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 1 {
+		t.Fatalf("drain pipe=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+	cpu.Regs[i386.EAX] = SysPoll
+	cpu.Regs[i386.EBX] = 400
+	cpu.Regs[i386.ECX] = 1
+	cpu.Regs[i386.EDX] = 0
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 1 {
+		t.Fatalf("hup poll=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+
+	if revents, _ := mem.Read16(406); revents&0x10 == 0 || revents&1 == 0 {
+		t.Fatalf("hup revents=0x%x", revents)
+	}
+}
+
+func TestPipeDup2KeepsWriterAlive(t *testing.T) {
+	mem := i386.NewMemory(16 * 1024)
+	cpu := i386.NewCPU(mem)
+	k := New(nil, pty.New())
+	cpu.Regs[i386.EAX] = SysPipe
+	cpu.Regs[i386.EBX] = 100
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	readFD, _ := mem.Read32(100)
+	writeFD, _ := mem.Read32(104)
+	cpu.Regs[i386.EAX] = SysDup2
+	cpu.Regs[i386.EBX] = writeFD
+	cpu.Regs[i386.ECX] = 20
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 20 {
+		t.Fatalf("dup2=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+	cpu.Regs[i386.EAX] = SysClose
+	cpu.Regs[i386.EBX] = writeFD
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.WriteBytes(200, []byte("z")); err != nil {
+		t.Fatal(err)
+	}
+	cpu.Regs[i386.EAX] = SysWrite
+	cpu.Regs[i386.EBX] = 20
+	cpu.Regs[i386.ECX] = 200
+	cpu.Regs[i386.EDX] = 1
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 1 {
+		t.Fatalf("dup writer=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+	cpu.Regs[i386.EAX] = SysClose
+	cpu.Regs[i386.EBX] = 20
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	cpu.Regs[i386.EAX] = SysRead
+	cpu.Regs[i386.EBX] = readFD
+	cpu.Regs[i386.ECX] = 300
+	cpu.Regs[i386.EDX] = 1
+	if err := k.Handle(cpu); err != nil || cpu.Regs[i386.EAX] != 1 {
+		t.Fatalf("dup read=(%d,%v)", cpu.Regs[i386.EAX], err)
+	}
+}
+
+func TestPipeRollbackOnBadUserPointer(t *testing.T) {
+	mem := i386.NewMemory(1024)
+	cpu := i386.NewCPU(mem)
+	k := New(nil, pty.New())
+	cpu.Regs[i386.EAX] = SysPipe
+	cpu.Regs[i386.EBX] = 1022
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != -ErrnoFault {
+		t.Fatalf("bad pipe pointer=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	if len(k.fds) != 0 {
+		t.Fatalf("pipe rollback leaked %d descriptors", len(k.fds))
+	}
+}

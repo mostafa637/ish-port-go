@@ -28,10 +28,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "ishrun:", err)
 		os.Exit(1)
 	}
+	scheduler := guest.NewScheduler(p)
 	if *interactive {
-		os.Exit(runInteractive(p, *limit, *timeout))
+		os.Exit(runInteractive(scheduler, p, *limit, *timeout))
 	}
-	if err := p.Run(context.Background(), *limit); err != nil {
+	ctx := context.Background()
+	cancel := func() {}
+	if *timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+	}
+	defer cancel()
+	if err := scheduler.Run(ctx, *limit); err != nil {
 		if output := p.TTY.DrainOutput(); len(output) > 0 {
 			_, _ = os.Stdout.Write(output)
 		}
@@ -44,7 +51,7 @@ func main() {
 	os.Exit(int(p.ExitCode))
 }
 
-func runInteractive(p *guest.Process, maxSteps uint64, timeout time.Duration) int {
+func runInteractive(scheduler *guest.Scheduler, p *guest.Process, maxSteps uint64, timeout time.Duration) int {
 	ctx := context.Background()
 	cancel := func() {}
 	if timeout > 0 {
@@ -54,7 +61,7 @@ func runInteractive(p *guest.Process, maxSteps uint64, timeout time.Duration) in
 
 	done := make(chan error, 1)
 	go func() {
-		done <- p.Run(ctx, maxSteps)
+		done <- scheduler.Run(ctx, maxSteps)
 		p.TTY.Close()
 	}()
 	go func() {

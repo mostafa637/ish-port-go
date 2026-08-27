@@ -80,7 +80,7 @@ func (p *Process) Step() error {
 		return p.Fault
 	}
 	if p.State == Blocked {
-		if !p.Kernel.TryResumeBlockedFutex(p.Image.CPU) {
+		if !p.Kernel.TryResumeBlocked(p.Image.CPU) {
 			return nil
 		}
 		p.State = Ready
@@ -111,11 +111,12 @@ func (p *Process) Step() error {
 		return p.Fault
 	}
 	p.Steps++
-	if p.Kernel.HasBlockedFutex() {
+	if p.Kernel.HasBlocked() {
 		p.State = Blocked
 		return nil
 	}
 	if p.Kernel.Exited {
+		p.Kernel.CloseOnExit()
 		p.State = Exited
 		p.ExitCode = p.Kernel.ExitCode
 		return nil

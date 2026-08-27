@@ -29,6 +29,7 @@ const (
 	SysSysinfo       = 116
 	SysRtSigreturn   = 173
 	SysRead          = 3
+	SysPipe          = 42
 	SysReadv         = 145
 	SysDup2          = 63
 	SysWrite         = 4
@@ -81,6 +82,7 @@ const (
 	SysFcntl64       = 221
 	SysGettid        = 224
 	SysDup3          = 330
+	SysPipe2         = 331
 	SysStatx         = 383
 	SysGetrandom     = 355
 	SysGetgroups     = 205
@@ -125,6 +127,20 @@ type futexBlock struct {
 	deadline time.Time
 }
 
+type pipeBlock struct {
+	fd    int
+	addr  uint32
+	count uint32
+	write bool
+	data  []byte
+}
+
+type waitBlock struct {
+	pid        int32
+	statusAddr uint32
+	options    uint32
+}
+
 type Kernel struct {
 	FS             *vfs.FS
 	Space          *i386.AddressSpace
@@ -154,6 +170,8 @@ type Kernel struct {
 	signalActions  map[uint32]SignalAction
 	schedulerAware bool
 	blockedFutex   *futexBlock
+	blockedPipe    *pipeBlock
+	blockedWait    *waitBlock
 }
 
 func New(fs *vfs.FS, tty *pty.Terminal) *Kernel {
@@ -213,6 +231,80 @@ func (k *Kernel) TryResumeBlockedFutex(cpu *i386.CPU) bool {
 	return true
 }
 
+func (k *Kernel) BlockWait4(pid int32, statusAddr, options uint32) bool {
+	if k.blockedWait != nil {
+		return false
+	}
+	k.blockedWait = &waitBlock{pid: pid, statusAddr: statusAddr, options: options}
+	return true
+}
+
+func (k *Kernel) HasBlocked() bool {
+	return k.blockedFutex != nil || k.blockedPipe != nil || k.blockedWait != nil
+}
+
+func (k *Kernel) TryResumeBlocked(cpu *i386.CPU) bool {
+	if k.blockedWait != nil {
+		blocked := k.blockedWait
+		k.blockedWait = nil
+		if k.OnWait4 == nil {
+			k.ret(cpu, -ErrnoNoSys)
+			return true
+		}
+		result := k.OnWait4(cpu, blocked.pid, blocked.statusAddr, blocked.options)
+		if result == -ErrnoAgain && k.blockedWait != nil {
+			return false
+		}
+		k.blockedWait = nil
+		k.ret(cpu, result)
+		return true
+	}
+	if k.blockedFutex != nil {
+		return k.TryResumeBlockedFutex(cpu)
+	}
+	if k.blockedPipe == nil {
+		return true
+	}
+	blocked := k.blockedPipe
+	handle, ok := k.fds[blocked.fd].(*pipeHandle)
+	if !ok {
+		k.blockedPipe = nil
+		k.ret(cpu, -ErrnoBadFD)
+		return true
+	}
+	if blocked.write {
+		n, err := handle.WriteNonblocking(blocked.data)
+		if errors.Is(err, errPipeWouldBlock) {
+			return false
+		}
+		k.blockedPipe = nil
+		if errors.Is(err, syscall.EPIPE) {
+			k.ret(cpu, -32) // EPIPE; SIGPIPE delivery is a later signal layer.
+		} else if err != nil {
+			k.ret(cpu, -ErrnoFault)
+		} else {
+			k.ret(cpu, int32(n))
+		}
+		return true
+	}
+	buf := make([]byte, capCount(blocked.count))
+	n, err := handle.ReadNonblocking(buf)
+	if errors.Is(err, errPipeWouldBlock) {
+		return false
+	}
+	k.blockedPipe = nil
+	if err != nil && err != io.EOF {
+		k.ret(cpu, -ErrnoFault)
+		return true
+	}
+	if err := cpu.Mem.WriteBytes(blocked.addr, buf[:n]); err != nil {
+		k.ret(cpu, -ErrnoFault)
+	} else {
+		k.ret(cpu, int32(n))
+	}
+	return true
+}
+
 func (k *Kernel) context() context.Context {
 	if k.ctx == nil {
 		return context.Background()
@@ -231,8 +323,9 @@ func (k *Kernel) CloneForChild(pid int32, space *i386.AddressSpace) *Kernel {
 	child.cwd = k.cwd
 	child.nextFD = k.nextFD
 	for fd, handle := range k.fds {
-		child.fds[fd] = handle
+		child.fds[fd] = cloneHandle(handle)
 	}
+
 	for fd, closed := range k.closedFDs {
 		child.closedFDs[fd] = closed
 	}
@@ -276,6 +369,10 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 		k.ret(cpu, 0)
 	case SysRead:
 		k.handleRead(cpu, int(arg(i386.EBX)), arg(i386.ECX), arg(i386.EDX))
+	case SysPipe:
+		k.pipe(cpu, arg(i386.EBX), 0)
+	case SysPipe2:
+		k.pipe(cpu, arg(i386.EBX), arg(i386.ECX))
 	case SysLseek:
 		k.lseek(cpu, int(arg(i386.EBX)), int64(int32(arg(i386.ECX))), int(arg(i386.EDX)))
 	case SysLLseek:
@@ -820,7 +917,18 @@ func (k *Kernel) poll(cpu *i386.CPU, fdsAddr, nfds uint32, timeout int32) {
 				if events&pollOut != 0 {
 					eventsOut |= pollOut
 				}
+			} else if pipe, isPipe := handle.(*pipeHandle); isPipe {
+				if events&pollIn != 0 && pipe.ReadReady() {
+					eventsOut |= pollIn
+				}
+				if events&pollOut != 0 && pipe.WriteReady() {
+					eventsOut |= pollOut
+				}
+				if pipe.Hangup() {
+					eventsOut |= pollHup
+				}
 			} else {
+
 				// Regular files are immediately readable and writable.
 				eventsOut = events
 			}
@@ -912,6 +1020,16 @@ func (k *Kernel) handleRead(cpu *i386.CPU, fd int, addr, count uint32) {
 	if f, ok := k.fds[fd]; ok {
 		if _, isTTY := f.(ttyHandle); isTTY && k.TTY != nil {
 			n, err = k.TTY.ReadInput(k.context(), buf)
+		} else if pipe, isPipe := f.(*pipeHandle); isPipe && k.schedulerAware {
+			n, err = pipe.ReadNonblocking(buf)
+			if errors.Is(err, errPipeWouldBlock) {
+				if k.blockedPipe == nil {
+					k.blockedPipe = &pipeBlock{fd: fd, addr: addr, count: count}
+					return
+				}
+				k.ret(cpu, -ErrnoAgain)
+				return
+			}
 		} else {
 			n, err = f.Read(buf)
 		}
@@ -924,6 +1042,8 @@ func (k *Kernel) handleRead(cpu *i386.CPU, fd int, addr, count uint32) {
 	if err != nil && err != io.EOF {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			k.ret(cpu, -ErrnoInterrupted)
+		} else if errors.Is(err, syscall.EAGAIN) {
+			k.ret(cpu, -ErrnoAgain)
 		} else {
 			k.ret(cpu, -ErrnoFault)
 		}
@@ -1016,6 +1136,13 @@ func (k *Kernel) handleReadv(cpu *i386.CPU, fd int, iovAddr, iovCount uint32) {
 				} else {
 					k.ret(cpu, int32(total))
 				}
+			} else if errors.Is(readErr, syscall.EAGAIN) {
+				if total == 0 {
+					k.ret(cpu, -ErrnoAgain)
+				} else {
+					k.ret(cpu, int32(total))
+				}
+				return
 			} else if total == 0 {
 				k.ret(cpu, -ErrnoFault)
 			} else {
@@ -1094,6 +1221,7 @@ func (k *Kernel) writeBytes(fd int, data []byte) (int, error) {
 	}
 	if f, ok := k.fds[fd]; ok {
 		return f.Write(data)
+
 	}
 	return 0, fmt.Errorf("bad file descriptor")
 }
@@ -1104,9 +1232,36 @@ func (k *Kernel) handleWrite(cpu *i386.CPU, fd int, addr, count uint32) {
 		k.ret(cpu, -ErrnoFault)
 		return
 	}
+	if f, ok := k.fds[fd].(*pipeHandle); ok && k.schedulerAware {
+		n, writeErr := f.WriteNonblocking(data)
+		if errors.Is(writeErr, errPipeWouldBlock) {
+			if k.blockedPipe == nil {
+				k.blockedPipe = &pipeBlock{fd: fd, addr: addr, count: count, write: true, data: append([]byte(nil), data...)}
+				return
+			}
+			k.ret(cpu, -ErrnoAgain)
+			return
+		}
+		if writeErr != nil {
+			if errors.Is(writeErr, syscall.EPIPE) {
+				k.ret(cpu, -32)
+			} else {
+				k.ret(cpu, -ErrnoFault)
+			}
+			return
+		}
+		k.ret(cpu, int32(n))
+		return
+	}
 	n, err := k.writeBytes(fd, data)
 	if err != nil {
-		k.ret(cpu, -ErrnoFault)
+		if errors.Is(err, syscall.EPIPE) {
+			k.ret(cpu, -32) // EPIPE; SIGPIPE delivery is a later signal layer.
+		} else if errors.Is(err, syscall.EAGAIN) {
+			k.ret(cpu, -ErrnoAgain)
+		} else {
+			k.ret(cpu, -ErrnoFault)
+		}
 		return
 	}
 	k.ret(cpu, int32(n))
@@ -1425,6 +1580,13 @@ func (k *Kernel) getdents64(cpu *i386.CPU, fd int, addr, count uint32) {
 
 func (k *Kernel) FSRootLimit(memory uint32) uint32 { return memory - 64*1024 }
 
+func (k *Kernel) CloseOnExit() {
+	for fd, handle := range k.fds {
+		_ = handle.Close()
+		delete(k.fds, fd)
+	}
+}
+
 func (k *Kernel) String() string {
 	return fmt.Sprintf("pid=%d brk=0x%x cwd=%s exited=%t code=%d", k.PID, k.Brk, k.cwd, k.Exited, k.ExitCode)
 }
@@ -1437,7 +1599,7 @@ func SyscallName(number uint32) string {
 		SysGetpid: "getpid", SysClone: "clone", SysGetpgrp: "getpgrp", SysSetpgid: "setpgid", SysSetsid: "setsid", SysGetsid: "getsid", SysGettid: "gettid", SysGetpgid: "getpgid", SysBrk: "brk", SysMunmap: "munmap", SysMprotect: "mprotect",
 		SysUname: "uname", SysGettimeofday: "gettimeofday", SysClockGettime: "clock_gettime",
 		SysGetrandom: "getrandom", SysGetgroups: "getgroups", SysSetgroups: "setgroups", SysPoll: "poll", SysFutex: "futex", SysReadlink: "readlink", SysGetdents64: "getdents64", SysOpenat: "openat",
-		SysFstatat64: "fstatat64", SysFcntl64: "fcntl64", SysDup3: "dup3", SysStatx: "statx", SysStatfs64: "statfs64", SysNanosleep: "nanosleep", SysGetcwd: "getcwd", SysExitGroup: "exit_group",
+		SysFstatat64: "fstatat64", SysFcntl64: "fcntl64", SysDup3: "dup3", SysPipe: "pipe", SysPipe2: "pipe2", SysStatx: "statx", SysStatfs64: "statfs64", SysNanosleep: "nanosleep", SysGetcwd: "getcwd", SysExitGroup: "exit_group",
 	}
 	if name, ok := names[number]; ok {
 		return name
@@ -1466,7 +1628,7 @@ func (k *Kernel) dup(cpu *i386.CPU, oldFD, newFD int, flags uint32, isDup3 bool)
 	if old, exists := k.fds[newFD]; exists && old != handle {
 		_ = old.Close()
 	}
-	k.fds[newFD] = handle
+	k.fds[newFD] = cloneHandle(handle)
 	delete(k.closedFDs, newFD)
 	if newFD >= k.nextFD {
 		k.nextFD = newFD + 1
@@ -1492,6 +1654,7 @@ func (k *Kernel) fcntl(cpu *i386.CPU, fd, command int, argument uint32) {
 		return
 	}
 	if command != fDupFD && command != fDupFDCloexec {
+
 		k.ret(cpu, -ErrnoInvalid)
 		return
 	}
@@ -1505,12 +1668,52 @@ func (k *Kernel) fcntl(cpu *i386.CPU, fd, command int, argument uint32) {
 		return
 	}
 	newFD := k.allocateFD(int(argument))
-	k.fds[newFD] = handle
+	k.fds[newFD] = cloneHandle(handle)
 	delete(k.closedFDs, newFD)
 	if newFD >= k.nextFD {
 		k.nextFD = newFD + 1
 	}
 	k.ret(cpu, int32(newFD))
+}
+
+func cloneHandle(handle fileHandle) fileHandle {
+	if dup, ok := handle.(interface{ CloneHandle() fileHandle }); ok {
+		return dup.CloneHandle()
+	}
+	return handle
+}
+
+func (k *Kernel) pipe(cpu *i386.CPU, pipefdAddr, flags uint32) {
+	const (
+		oNonblock = 0x800
+		oCloexec  = 0x80000
+	)
+	if flags&^(oNonblock|oCloexec) != 0 {
+		k.ret(cpu, -ErrnoInvalid)
+		return
+	}
+	readEnd, writeEnd := newPipePair(flags&oNonblock != 0)
+	readFD := k.allocateFD(0)
+	writeFD := k.allocateFD(readFD + 1)
+	k.fds[readFD] = readEnd
+	k.fds[writeFD] = writeEnd
+	if err := cpu.Mem.Write32(pipefdAddr, uint32(readFD)); err != nil {
+		delete(k.fds, readFD)
+		delete(k.fds, writeFD)
+		_ = readEnd.Close()
+		_ = writeEnd.Close()
+		k.ret(cpu, -ErrnoFault)
+		return
+	}
+	if err := cpu.Mem.Write32(pipefdAddr+4, uint32(writeFD)); err != nil {
+		delete(k.fds, readFD)
+		delete(k.fds, writeFD)
+		_ = readEnd.Close()
+		_ = writeEnd.Close()
+		k.ret(cpu, -ErrnoFault)
+		return
+	}
+	k.ret(cpu, 0)
 }
 
 func (k *Kernel) handleForFD(fd int) (fileHandle, bool) {

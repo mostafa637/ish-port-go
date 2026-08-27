@@ -107,3 +107,12 @@ full-port-research.md                قيود iOS ومراجع المعماري�
 بُني CLI المرجع من `/home/ubuntu/ish-port` عبر Meson/Ninja، وشُغّل GDB على executable الأصلي وعلى `ishrun` Go المبني مع debug symbols، باستخدام نفس Alpine x86 rootfs. في سيناريو `busybox true` وصل المرجع إلى `exit_handler` مع guest `code=0` و`eax=0xfc`، بينما التقط Go سلسلة syscalls وانتهت بـ`eax=0xfc` أيضًا؛ وكلا الـinferiors انتهى طبيعيًا. وفي `busybox echo gdb-parity` طبع كلاهما النص نفسه وانتهى طبيعيًا.
 
 التقرير القابل للمراجعة هو `gdb-comparison-v3.md`، وأوامر GDB هي `gdb-original.cmd` و`gdb-go.cmd`. هذه مقارنة behavior/guest-state عند حدود مختلفة، وليست ادعاء تطابق instruction-by-instruction: GDB يرى guest CPU مباشرة داخل struct المرجع الأصلي، ويرى guest CPU الممرر إلى syscall boundary في Go، أما سجلات host x86-64 فلا تُقارن كسجلات guest i386.
+
+
+## الجولة الحالية: pipes وshell pipelines
+
+أضيف دعم Pure Go لـ`pipe(2)` رقم 42 و`pipe2(2)` رقم 331 مع endpoints داخلية مشتركة، buffer محدود، EOF بعد إغلاق جميع writers، `EPIPE` عند غياب readers، و`O_NONBLOCK` مع `EAGAIN`. تدعم descriptors الجديدة `dup2` وfork inheritance عبر reference counts مستقلة، ويعرض `poll` readiness وHUP الأساسيين.
+
+عند تشغيل Scheduler، لا يحجب read/write على pipe goroutine المضيف؛ تُحفظ العملية في `Process.Blocked` وتُستأنف عند توفر البيانات أو المساحة. كما أصبح `wait4` blocking scheduler-aware، وأصبح `ishrun` يستخدم Scheduler في الوضعين interactive وnon-interactive. أثبت اختبار تكامل `busybox sh -c 'echo pipe-ok | wc -c'` خروجًا بالرمز 0 ونتيجة `8`، وأضيفت الحالة إلى matrix التشغيلية التي أصبحت 35 حالة محددة.
+
+هذا لا يثبت shell POSIX كاملًا. ما زال `SIGPIPE` كتسليم signal تلقائي، blocking `poll` على pipe، تطبيق `O_CLOEXEC` أثناء `execve`، وpipe wait queues متعددة العمليات خارج التغطية الكاملة، كما أن shared threads و`CLONE_VM/CLONE_THREAD` غير مفعّلة.

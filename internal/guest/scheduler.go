@@ -77,7 +77,10 @@ func (s *Scheduler) wait4(parent *Process, cpu *i386.CPU, requested int32, statu
 			if options&1 != 0 { // WNOHANG
 				return 0
 			}
-			return -11 // EAGAIN: scheduler will run the child on the next turn.
+			if parent.Kernel.BlockWait4(requested, statusAddr, options) {
+				return -11 // EAGAIN: Kernel retains the wait and scheduler resumes it.
+			}
+			return -11
 		}
 		if statusAddr != 0 {
 			status := uint32(task.Process.ExitCode&0xff) << 8
@@ -106,7 +109,7 @@ func (s *Scheduler) Step() (bool, error) {
 			continue
 		}
 		if task.Process.State == Blocked {
-			if !task.Process.Kernel.TryResumeBlockedFutex(task.Process.Image.CPU) {
+			if !task.Process.Kernel.TryResumeBlocked(task.Process.Image.CPU) {
 				continue
 			}
 			task.Process.State = Ready

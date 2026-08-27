@@ -70,3 +70,12 @@ ISHGO_ROOT=./testdata/alpine-x86 ISHGO_GUEST=1 go run ./cmd/ishgo
 أُصلح مسار ishrun non-interactive ليضخ PTY output إلى stdout بعد أن كشف GDB اختلافًا عن iSH الأصلي. بُني CLI المرجع الأصلي وishrun Go مع debug symbols، وشُغّل GDB على الاثنين باستخدام نفس Alpine x86 rootfs. أثبت `busybox true` exit behavior وguest exit syscall، وأثبت `busybox echo gdb-parity` تطابق stdout والـnormal exit. التقرير التفصيلي والـGDB command files موجودة في المصدر.
 
 لا يعني ذلك تطابقًا instruction-by-instruction؛ فبنية C interpreter وGo interpreter مختلفة، والمرجع يستخدم realfs بينما Go يستخدم VFS محصورًا، كما أن MMU/page faults/COW وshared threads وLinux ABI الكامل ما زالت خارج نطاق هذا milestone.
+
+
+## الجولة الحالية: guest pipes وshell pipelines
+
+أضيفت واجهتا `pipe(2)` و`pipe2(2)` لـLinux i386، مع buffer Pure Go مشترك وEOF و`EPIPE` وnonblocking `EAGAIN`. أضيف دعم descriptor duplication وfork inheritance عبر reference counts، وreadiness/HUP الأساسي إلى `poll`. عند امتلاء pipe أو خلوه في Scheduler لا يُحجب host goroutine؛ تُستخدم حالة blocked ويُعاد تنفيذ syscall عند الجاهزية.
+
+أصبح blocking `wait4` scheduler-aware أيضًا، وأصبح `ishrun` يمرر guest إلى cooperative Scheduler بدل `Process.Run` المباشر؛ لذلك تعمل الآن fork-based shell pipelines. أثبت الاختبار `busybox sh -c 'echo pipe-ok | wc -c'` الخروج 0 والمخرج `8`، ونجحت matrix التشغيلية في 35/35 حالة محددة.
+
+القيود المقصودة: `SIGPIPE` لا يُسلّم تلقائيًا بعد، وblocking `poll` للـpipes ليس wait queue متكاملًا، و`O_CLOEXEC` لا يُطبّق بعد عبر exec، وshared threads و`CLONE_VM/CLONE_THREAD` غير مفعّلة. هذه الجولة تثبت pipeline محددًا ولا تثبت shell POSIX أو BusyBox عامًا.

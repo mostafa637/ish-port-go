@@ -57,11 +57,15 @@ cases=(
   'free'
   'which|sh'
   'readlink|-f|/bin/sh'
+  'sh|-c|echo pipe-ok __PIPE__ wc -c'
 )
 
 failures=0
 for spec in "${cases[@]}"; do
   IFS='|' read -r -a argv <<< "$spec"
+  if [[ "${argv[0]:-}" == 'sh' && "${argv[1]:-}" == '-c' && "${argv[2]:-}" == *__PIPE__* ]]; then
+    argv[2]=${argv[2]//__PIPE__/|}
+  fi
   rc=0
   output=$(timeout 30s "$BIN" -root "$ROOT" -steps "$STEPS" "$ROOT/bin/busybox" "${argv[@]}" 2>&1) || rc=$?
   compact=$(printf '%s' "$output" | tr '\n' ' ' | cut -c1-180)
