@@ -614,3 +614,97 @@ func TestPipeRollbackOnBadUserPointer(t *testing.T) {
 		t.Fatalf("pipe rollback leaked %d descriptors", len(k.fds))
 	}
 }
+
+func TestPipeEPIPEQueuesSIGPIPE(t *testing.T) {
+	mem := i386.NewMemory(16 * 1024)
+	cpu := i386.NewCPU(mem)
+	k := New(nil, pty.New())
+	cpu.Regs[i386.EAX] = SysPipe
+	cpu.Regs[i386.EBX] = 100
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	readFD, _ := mem.Read32(100)
+	writeFD, _ := mem.Read32(104)
+	cpu.Regs[i386.EAX] = SysClose
+	cpu.Regs[i386.EBX] = readFD
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 0 {
+		t.Fatalf("close reader=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	if err := mem.WriteBytes(200, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	cpu.Regs[i386.EAX] = SysWrite
+	cpu.Regs[i386.EBX] = writeFD
+	cpu.Regs[i386.ECX] = 200
+	cpu.Regs[i386.EDX] = 1
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != -32 {
+		t.Fatalf("write EPIPE=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	if k.pendingSignals&(uint64(1)<<(13-1)) == 0 {
+		t.Fatalf("SIGPIPE not pending: 0x%x", k.pendingSignals)
+	}
+}
+
+func TestPipeCloexecAndDupFlags(t *testing.T) {
+	mem := i386.NewMemory(16 * 1024)
+	cpu := i386.NewCPU(mem)
+	k := New(nil, pty.New())
+	cpu.Regs[i386.EAX] = SysPipe2
+	cpu.Regs[i386.EBX] = 100
+	cpu.Regs[i386.ECX] = 0x80000 // O_CLOEXEC
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 0 {
+		t.Fatalf("pipe2 cloexec=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	readFD, _ := mem.Read32(100)
+	writeFD, _ := mem.Read32(104)
+	for _, fd := range []uint32{readFD, writeFD} {
+		cpu.Regs[i386.EAX] = SysFcntl
+		cpu.Regs[i386.EBX] = fd
+		cpu.Regs[i386.ECX] = 1 // F_GETFD
+		if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 1 {
+			t.Fatalf("getfd(%d)=(%d,%v)", fd, int32(cpu.Regs[i386.EAX]), err)
+		}
+	}
+	cpu.Regs[i386.EAX] = SysDup2
+	cpu.Regs[i386.EBX] = readFD
+	cpu.Regs[i386.ECX] = 20
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 20 {
+		t.Fatalf("dup2=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	cpu.Regs[i386.EAX] = SysFcntl
+	cpu.Regs[i386.EBX] = 20
+	cpu.Regs[i386.ECX] = 1
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 0 {
+		t.Fatalf("dup2 cleared cloexec=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	cpu.Regs[i386.EAX] = SysDup3
+	cpu.Regs[i386.EBX] = readFD
+	cpu.Regs[i386.ECX] = 21
+	cpu.Regs[i386.EDX] = 0x80000
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 21 {
+		t.Fatalf("dup3 cloexec=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	cpu.Regs[i386.EAX] = SysFcntl
+	cpu.Regs[i386.EBX] = 21
+	cpu.Regs[i386.ECX] = 1
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 1 {
+		t.Fatalf("dup3 cloexec flag=(%d,%v)", int32(cpu.Regs[i386.EAX]), err)
+	}
+	cpu.Regs[i386.EAX] = SysFcntl
+	cpu.Regs[i386.EBX] = 20
+	cpu.Regs[i386.ECX] = 1030 // F_DUPFD_CLOEXEC
+	cpu.Regs[i386.EDX] = 30
+	if err := k.Handle(cpu); err != nil || int32(cpu.Regs[i386.EAX]) != 30 || !k.fdCloexec[30] {
+		t.Fatalf("fcntl dupfd cloexec=(%d,%v) flags=%v", int32(cpu.Regs[i386.EAX]), err, k.fdCloexec)
+	}
+	k.CloseCloexec()
+	for _, fd := range []int{int(readFD), int(writeFD), 21, 30} {
+		if _, ok := k.fds[fd]; ok {
+			t.Fatalf("cloexec descriptor %d survived: %v", fd, k.fds)
+		}
+	}
+	if _, ok := k.fds[20]; !ok {
+		t.Fatal("non-cloexec dup2 descriptor was closed")
+	}
+}

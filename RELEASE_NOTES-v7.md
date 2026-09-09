@@ -79,3 +79,10 @@ ISHGO_ROOT=./testdata/alpine-x86 ISHGO_GUEST=1 go run ./cmd/ishgo
 أصبح blocking `wait4` scheduler-aware أيضًا، وأصبح `ishrun` يمرر guest إلى cooperative Scheduler بدل `Process.Run` المباشر؛ لذلك تعمل الآن fork-based shell pipelines. أثبت الاختبار `busybox sh -c 'echo pipe-ok | wc -c'` الخروج 0 والمخرج `8`، ونجحت matrix التشغيلية في 35/35 حالة محددة.
 
 القيود المقصودة: `SIGPIPE` لا يُسلّم تلقائيًا بعد، وblocking `poll` للـpipes ليس wait queue متكاملًا، و`O_CLOEXEC` لا يُطبّق بعد عبر exec، وshared threads و`CLONE_VM/CLONE_THREAD` غير مفعّلة. هذه الجولة تثبت pipeline محددًا ولا تثبت shell POSIX أو BusyBox عامًا.
+
+
+## الجولة التالية: SIGPIPE وFD_CLOEXEC
+
+أضيفت SIGPIPE عند EPIPE في pipe write paths، مع إبقاء syscall result `-EPIPE` وتسليم signal عبر pending signal boundary. أضيفت كذلك `FD_CLOEXEC` لـ`pipe2(O_CLOEXEC)` وfcntl flags و`dup3(O_CLOEXEC)`، مع clearing في `dup2` وإغلاق descriptors بعد نجاح execve فقط.
+
+تثبت اختبارات kernel هذه المسارات دون الادعاء بأن signal semantics الكاملة أو signal groups وthreads قد اكتملت.

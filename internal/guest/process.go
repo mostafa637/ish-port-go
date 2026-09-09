@@ -193,6 +193,7 @@ func (p *Process) replaceImage(oldCPU *i386.CPU, guestPath string, argv, envp []
 	if err != nil {
 		return err
 	}
+	p.Kernel.CloseCloexec()
 	oldCPU.Halted = true
 	p.Image = image
 	p.Env = append([]string(nil), envp...)

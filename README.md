@@ -116,3 +116,10 @@ full-port-research.md                قيود iOS ومراجع المعماري�
 عند تشغيل Scheduler، لا يحجب read/write على pipe goroutine المضيف؛ تُحفظ العملية في `Process.Blocked` وتُستأنف عند توفر البيانات أو المساحة. كما أصبح `wait4` blocking scheduler-aware، وأصبح `ishrun` يستخدم Scheduler في الوضعين interactive وnon-interactive. أثبت اختبار تكامل `busybox sh -c 'echo pipe-ok | wc -c'` خروجًا بالرمز 0 ونتيجة `8`، وأضيفت الحالة إلى matrix التشغيلية التي أصبحت 35 حالة محددة.
 
 هذا لا يثبت shell POSIX كاملًا. ما زال `SIGPIPE` كتسليم signal تلقائي، blocking `poll` على pipe، تطبيق `O_CLOEXEC` أثناء `execve`، وpipe wait queues متعددة العمليات خارج التغطية الكاملة، كما أن shared threads و`CLONE_VM/CLONE_THREAD` غير مفعّلة.
+
+
+## الجولة الحالية: SIGPIPE وclose-on-exec
+
+أضيفت معالجة `SIGPIPE` عند فشل الكتابة إلى pipe بلا readers: تعيد syscall قيمة `-EPIPE` وتضع signal 13 في pending signal state، ثم يمر التسليم عبر نفس boundary الموجود في `Process.Step` وdefault disposition. كما أضيفت دلالات `FD_CLOEXEC` لـ`pipe2(O_CLOEXEC)` و`fcntl(F_GETFD/F_SETFD/F_DUPFD_CLOEXEC)` و`dup3(O_CLOEXEC)`، مع مسح العلم عند `dup2` وإغلاق descriptors المعلّمة فقط بعد نجاح `execve`.
+
+اختبارات kernel تثبت EPIPE وSIGPIPE، flags القراءة، نسخ descriptors، ومسح CLOEXEC عند exec boundary. هذا لا يعني بعد تنفيذ signal delivery الكامل لكل signals؛ ما زالت signal actions المتقدمة و`SA_SIGINFO` وSIGPIPE الخاصة بالـthreads خارج النطاق.

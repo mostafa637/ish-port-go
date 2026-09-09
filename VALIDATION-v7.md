@@ -103,3 +103,10 @@ go vet ./...
 ## ملاحظة موارد الاختبار
 
 نجحت `GOMAXPROCS=2 go test -race ./...` بعد عزل اختبار guest pipeline الثقيل في `internal/runtime/pipeline_test.go` بوسم `//go:build !race`؛ تشغيل نفس الاختبار العادي وCLI matrix pipeline نجحا منفصلين. هذا إجراء موارد مقصود لأن fork-style guest ينسخ CPU وAddressSpace، وrace instrumentation يرفع استهلاك الذاكرة، وليس تجاهلًا لفشل اختبار. يجب عند تفسير نتائج race التفريق بين suite race الكاملة واختبار pipeline التشغيلي المنفصل.
+
+
+## SIGPIPE وFD_CLOEXEC
+
+أصبح EPIPE الناتج من الكتابة إلى pipe بلا readers يضع signal 13 (`SIGPIPE`) في pending signal state، بينما تبقى قيمة syscall `-EPIPE`. يغطي ذلك `write` و`writev` وblocked scheduler write. يمر default action عبر `Process.Step`؛ لا يُقدّم هذا كتنفيذ كامل لإشارات threads أو signal groups.
+
+أضيف `FD_CLOEXEC` لـ`pipe2(O_CLOEXEC)` و`fcntl(F_GETFD/F_SETFD/F_DUPFD_CLOEXEC)` و`dup3(O_CLOEXEC)`. `dup2` يمسح العلم كما في Linux، و`execve` يغلق descriptors المعلّمة بعد نجاح تحميل الصورة فقط. اختبارات kernel تثبت flags، duplication، EPIPE/SIGPIPE، وclose-on-exec metadata.

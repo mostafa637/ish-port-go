@@ -127,3 +127,10 @@ go build -trimpath -o ./ishrun ./cmd/ishrun
 بعد إصلاح fork endpoint sharing وتوصيل `ishrun` إلى Scheduler، نجح `busybox sh -c 'echo pipe-ok | wc -c'` عبر CLI وSession: exit code=0 وoutput=`8`. أضيفت الحالة إلى `scripts/busybox_matrix.sh` بترميز `__PIPE__` لتجنب تعارض separator، فأصبحت المصفوفة 35 حالة ونجحت 0/35.
 
 توجد اختبارات kernel للـpipe lifecycle وnonblocking وpoll وdup2 وrollback، واختبار runtime pipeline. ما يزال SIGPIPE التلقائي، blocking poll الكامل للpipe، O_CLOEXEC عبر exec، وCLONE_VM/CLONE_THREAD خارج التنفيذ الكامل.
+
+
+## الجولة الحالية: SIGPIPE وFD_CLOEXEC
+
+أضيف queueSignal لـSIGPIPE عند EPIPE في write/writev وblocked pipe write، مع إبقاء syscall result `-EPIPE`. أضيفت map لـFD_CLOEXEC داخل Kernel، ونسخ metadata عند fork، و`CloseCloexec` بعد نجاح execve. يدعم `pipe2(O_CLOEXEC)` و`fcntl(F_GETFD/F_SETFD/F_DUPFD_CLOEXEC)` و`dup3(O_CLOEXEC)`، بينما يمسح `dup2` العلم على descriptor الجديد.
+
+أضيفت اختبارات kernel لـEPIPE/SIGPIPE وCLOEXEC/dup/fcntl/close-on-exec. يجب أن تتضمن الجولة التالية full test وrace/vet وBusyBox matrix، ثم commit وpush إلى GitHub. ما زالت signal groups وSA_SIGINFO وthread semantics المتقدمة خارج النطاق.

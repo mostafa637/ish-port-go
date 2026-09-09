@@ -157,6 +157,7 @@ type Kernel struct {
 	cwd            string
 	fds            map[int]fileHandle
 	closedFDs      map[int]bool
+	fdCloexec      map[int]bool
 	nextFD         int
 	nextMap        uint32
 	Exited         bool
@@ -175,7 +176,7 @@ type Kernel struct {
 }
 
 func New(fs *vfs.FS, tty *pty.Terminal) *Kernel {
-	return &Kernel{FS: fs, TTY: tty, PID: 1, cwd: "/", fds: make(map[int]fileHandle), closedFDs: make(map[int]bool), nextFD: 3, nextMap: 0x02000000, futexMu: &sync.Mutex{}, futexWaiters: make(map[uint32][]chan struct{}), signalActions: make(map[uint32]SignalAction)}
+	return &Kernel{FS: fs, TTY: tty, PID: 1, cwd: "/", fds: make(map[int]fileHandle), closedFDs: make(map[int]bool), fdCloexec: make(map[int]bool), nextFD: 3, nextMap: 0x02000000, futexMu: &sync.Mutex{}, futexWaiters: make(map[uint32][]chan struct{}), signalActions: make(map[uint32]SignalAction)}
 }
 
 func (k *Kernel) Attach(cpu *i386.CPU) {
@@ -279,7 +280,8 @@ func (k *Kernel) TryResumeBlocked(cpu *i386.CPU) bool {
 		}
 		k.blockedPipe = nil
 		if errors.Is(err, syscall.EPIPE) {
-			k.ret(cpu, -32) // EPIPE; SIGPIPE delivery is a later signal layer.
+			k.queueSignal(13) // SIGPIPE
+			k.ret(cpu, -32)
 		} else if err != nil {
 			k.ret(cpu, -ErrnoFault)
 		} else {
@@ -329,6 +331,10 @@ func (k *Kernel) CloneForChild(pid int32, space *i386.AddressSpace) *Kernel {
 	for fd, closed := range k.closedFDs {
 		child.closedFDs[fd] = closed
 	}
+	for fd, cloexec := range k.fdCloexec {
+		child.fdCloexec[fd] = cloexec
+	}
+
 	child.OnExecve = k.OnExecve
 	child.OnSyscall = k.OnSyscall
 	child.OnSyscallDone = k.OnSyscallDone
@@ -409,6 +415,7 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 			_ = f.Close()
 			delete(k.fds, fd)
 			delete(k.closedFDs, fd)
+			delete(k.fdCloexec, fd)
 			k.ret(cpu, 0)
 		} else if fd >= 0 && fd <= 2 && k.TTY != nil && !k.closedFDs[fd] {
 			k.closedFDs[fd] = true
@@ -594,6 +601,13 @@ func (k *Kernel) TakePendingSignal() (uint32, SignalAction, bool) {
 	return 0, SignalAction{}, false
 }
 
+func (k *Kernel) queueSignal(signal uint32) {
+	if signal == 0 || signal > 64 {
+		return
+	}
+	k.pendingSignals |= uint64(1) << (signal - 1)
+}
+
 func (k *Kernel) kill(cpu *i386.CPU, pid int32, signal uint32) {
 	if pid != k.PID && pid != 0 && pid != -1 {
 		k.ret(cpu, -ErrnoNoProcess)
@@ -604,7 +618,7 @@ func (k *Kernel) kill(cpu *i386.CPU, pid int32, signal uint32) {
 		return
 	}
 	if signal != 0 {
-		k.pendingSignals |= uint64(1) << (signal - 1)
+		k.queueSignal(signal)
 	}
 	k.ret(cpu, 0)
 }
@@ -1220,8 +1234,11 @@ func (k *Kernel) writeBytes(fd int, data []byte) (int, error) {
 		return k.TTY.WriteOutput(data)
 	}
 	if f, ok := k.fds[fd]; ok {
-		return f.Write(data)
-
+		n, err := f.Write(data)
+		if errors.Is(err, syscall.EPIPE) {
+			k.queueSignal(13) // SIGPIPE
+		}
+		return n, err
 	}
 	return 0, fmt.Errorf("bad file descriptor")
 }
@@ -1244,7 +1261,9 @@ func (k *Kernel) handleWrite(cpu *i386.CPU, fd int, addr, count uint32) {
 		}
 		if writeErr != nil {
 			if errors.Is(writeErr, syscall.EPIPE) {
+				k.queueSignal(13) // SIGPIPE
 				k.ret(cpu, -32)
+
 			} else {
 				k.ret(cpu, -ErrnoFault)
 			}
@@ -1580,6 +1599,20 @@ func (k *Kernel) getdents64(cpu *i386.CPU, fd int, addr, count uint32) {
 
 func (k *Kernel) FSRootLimit(memory uint32) uint32 { return memory - 64*1024 }
 
+func (k *Kernel) CloseCloexec() {
+	for fd, cloexec := range k.fdCloexec {
+		if !cloexec {
+			continue
+		}
+		if handle, ok := k.fds[fd]; ok {
+			_ = handle.Close()
+			delete(k.fds, fd)
+		}
+		delete(k.fdCloexec, fd)
+		delete(k.closedFDs, fd)
+	}
+}
+
 func (k *Kernel) CloseOnExit() {
 	for fd, handle := range k.fds {
 		_ = handle.Close()
@@ -1630,6 +1663,10 @@ func (k *Kernel) dup(cpu *i386.CPU, oldFD, newFD int, flags uint32, isDup3 bool)
 	}
 	k.fds[newFD] = cloneHandle(handle)
 	delete(k.closedFDs, newFD)
+	delete(k.fdCloexec, newFD)
+	if isDup3 && flags&0x80000 != 0 {
+		k.fdCloexec[newFD] = true
+	}
 	if newFD >= k.nextFD {
 		k.nextFD = newFD + 1
 	}
@@ -1650,7 +1687,27 @@ func (k *Kernel) fcntl(cpu *i386.CPU, fd, command int, argument uint32) {
 			k.ret(cpu, -ErrnoBadFD)
 			return
 		}
-		k.ret(cpu, 0)
+		switch command {
+		case fGetFD:
+			if k.fdCloexec[fd] {
+				k.ret(cpu, 1) // FD_CLOEXEC
+			} else {
+				k.ret(cpu, 0)
+			}
+		case fSetFD:
+			if argument&^uint32(1) != 0 {
+				k.ret(cpu, -ErrnoInvalid)
+				return
+			}
+			if argument&1 != 0 {
+				k.fdCloexec[fd] = true
+			} else {
+				delete(k.fdCloexec, fd)
+			}
+			k.ret(cpu, 0)
+		default:
+			k.ret(cpu, 0)
+		}
 		return
 	}
 	if command != fDupFD && command != fDupFDCloexec {
@@ -1670,6 +1727,10 @@ func (k *Kernel) fcntl(cpu *i386.CPU, fd, command int, argument uint32) {
 	newFD := k.allocateFD(int(argument))
 	k.fds[newFD] = cloneHandle(handle)
 	delete(k.closedFDs, newFD)
+	delete(k.fdCloexec, newFD)
+	if command == fDupFDCloexec {
+		k.fdCloexec[newFD] = true
+	}
 	if newFD >= k.nextFD {
 		k.nextFD = newFD + 1
 	}
@@ -1697,9 +1758,15 @@ func (k *Kernel) pipe(cpu *i386.CPU, pipefdAddr, flags uint32) {
 	writeFD := k.allocateFD(readFD + 1)
 	k.fds[readFD] = readEnd
 	k.fds[writeFD] = writeEnd
+	if flags&oCloexec != 0 {
+		k.fdCloexec[readFD] = true
+		k.fdCloexec[writeFD] = true
+	}
 	if err := cpu.Mem.Write32(pipefdAddr, uint32(readFD)); err != nil {
 		delete(k.fds, readFD)
 		delete(k.fds, writeFD)
+		delete(k.fdCloexec, readFD)
+		delete(k.fdCloexec, writeFD)
 		_ = readEnd.Close()
 		_ = writeEnd.Close()
 		k.ret(cpu, -ErrnoFault)
@@ -1708,6 +1775,8 @@ func (k *Kernel) pipe(cpu *i386.CPU, pipefdAddr, flags uint32) {
 	if err := cpu.Mem.Write32(pipefdAddr+4, uint32(writeFD)); err != nil {
 		delete(k.fds, readFD)
 		delete(k.fds, writeFD)
+		delete(k.fdCloexec, readFD)
+		delete(k.fdCloexec, writeFD)
 		_ = readEnd.Close()
 		_ = writeEnd.Close()
 		k.ret(cpu, -ErrnoFault)
