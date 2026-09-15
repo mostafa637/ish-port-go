@@ -116,7 +116,9 @@ func (p *Process) Step() error {
 		return nil
 	}
 	if p.Kernel.Exited {
-		p.Kernel.CloseOnExit()
+		if !p.Kernel.Thread {
+			p.Kernel.CloseOnExit()
+		}
 		p.State = Exited
 		p.ExitCode = p.Kernel.ExitCode
 		return nil
@@ -170,6 +172,32 @@ func (p *Process) CloneForFork(pid int32) *Process {
 	image.Memory = space.Mem
 	childKernel := p.Kernel.CloneForChild(pid, space)
 	child := &Process{Image: image, Kernel: childKernel, TTY: p.TTY, FS: p.FS, State: Ready, PID: pid, ParentPID: p.PID, Env: append([]string(nil), p.Env...)}
+	childKernel.OnExecve = child.replaceImage
+	childKernel.Attach(image.CPU)
+	return child
+}
+
+// CloneForThread copies register state but shares the address space and the
+// kernel's process-wide resources. The child starts at the same instruction
+// boundary and observes a zero clone return value.
+func (p *Process) CloneForThread(pid int32, childStack, tls uint32) *Process {
+	childCPU := *p.Image.CPU
+	childCPU.Regs[i386.EAX] = 0
+	childCPU.Halted = false
+	childCPU.OnSyscall = nil
+	if childStack != 0 {
+		childCPU.Regs[i386.ESP] = childStack
+	}
+	if tls != 0 {
+		childCPU.GSBase = tls
+	}
+	image := &elf32.Image{Memory: p.Image.Memory, Space: p.Image.Space, CPU: &childCPU,
+		Entry: p.Image.Entry, Start: p.Image.Start, Interpreter: p.Image.Interpreter,
+		InterpreterEntry: p.Image.InterpreterEntry, Stack: p.Image.Stack, Brk: p.Image.Brk,
+		Env: append([]string(nil), p.Env...)}
+	childKernel := p.Kernel.CloneForThread(pid)
+	child := &Process{Image: image, Kernel: childKernel, TTY: p.TTY, FS: p.FS,
+		State: Ready, PID: pid, ParentPID: p.ParentPID, Env: append([]string(nil), p.Env...)}
 	childKernel.OnExecve = child.replaceImage
 	childKernel.Attach(image.CPU)
 	return child

@@ -92,6 +92,19 @@ const (
 	SysRtSigaction   = 174
 )
 
+// i386 Linux clone flags used by the thread-aware scheduler.
+const (
+	CloneVM            = 0x00000100
+	CloneFS            = 0x00000200
+	CloneFiles         = 0x00000400
+	CloneSighand       = 0x00000800
+	CloneThread        = 0x00010000
+	CloneSettls        = 0x00080000
+	CloneParentSettid  = 0x00100000
+	CloneChildCleartid = 0x00200000
+	CloneChildSettid   = 0x01000000
+)
+
 const (
 	ErrnoSuccess     = 0
 	ErrnoInterrupted = 4
@@ -112,6 +125,7 @@ const (
 // through the VFS root.
 type ExecveHandler func(cpu *i386.CPU, path string, argv, envp []string) error
 type ForkHandler func(cpu *i386.CPU) (int32, error)
+type CloneHandler func(cpu *i386.CPU, flags, childStack, parentTID, childTID, tls uint32) (int32, error)
 type Wait4Handler func(cpu *i386.CPU, pid int32, statusAddr, options uint32) int32
 
 type SignalAction struct {
@@ -147,10 +161,12 @@ type Kernel struct {
 	TTY            *pty.Terminal
 	OnExecve       ExecveHandler
 	OnFork         ForkHandler
+	OnClone        CloneHandler
 	OnWait4        Wait4Handler
 	OnSyscall      func(number uint32, cpu *i386.CPU)
 	OnSyscallDone  func(number uint32, cpu *i386.CPU)
 	PID            int32
+	Thread         bool
 	Brk            uint32
 	HeapStart      uint32
 	HeapEnd        uint32
@@ -352,6 +368,21 @@ func (k *Kernel) CloneForChild(pid int32, space *i386.AddressSpace) *Kernel {
 	return child
 }
 
+// CloneForThread creates the per-thread kernel view required by CLONE_VM.
+// Address space, descriptor table, cwd, signal actions, and futex queues are
+// deliberately shared; CPU state and the thread id remain private.
+func (k *Kernel) CloneForThread(pid int32) *Kernel {
+	child := k.CloneForChild(pid, k.Space)
+	child.Thread = true
+	child.fds = k.fds
+	child.closedFDs = k.closedFDs
+	child.fdCloexec = k.fdCloexec
+	child.signalActions = k.signalActions
+	child.signalMask = k.signalMask
+	child.pendingSignals = 0
+	return child
+}
+
 func (k *Kernel) ret(cpu *i386.CPU, value int32) { cpu.Regs[i386.EAX] = uint32(value) }
 
 func capCount(count uint32) int {
@@ -518,6 +549,20 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 	case SysFutex:
 		k.futex(cpu, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX), arg(i386.ESI))
 	case SysFork, SysClone:
+		if n == SysClone && k.OnClone != nil {
+			flags, childStack := arg(i386.EBX), arg(i386.ECX)
+			parentTID, tls := arg(i386.EDX), arg(i386.ESI)
+			childTID := arg(i386.EDI)
+			if flags&(CloneVM|CloneThread) == (CloneVM | CloneThread) {
+				childPID, err := k.OnClone(cpu, flags, childStack, parentTID, childTID, tls)
+				if err != nil {
+					k.ret(cpu, -ErrnoFault)
+				} else {
+					k.ret(cpu, childPID)
+				}
+				break
+			}
+		}
 		if k.OnFork == nil {
 			k.ret(cpu, -ErrnoNoSys)
 			break

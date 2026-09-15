@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"example.com/ish-go/internal/i386"
+	"example.com/ish-go/internal/kernel"
 )
 
 type Task struct {
@@ -39,6 +40,9 @@ func (s *Scheduler) wire(p *Process) {
 	p.Kernel.OnFork = func(cpu *i386.CPU) (int32, error) {
 		return s.fork(p.PID)
 	}
+	p.Kernel.OnClone = func(cpu *i386.CPU, flags, childStack, parentTID, childTID, tls uint32) (int32, error) {
+		return s.clone(p.PID, cpu, flags, childStack, parentTID, childTID, tls)
+	}
 	p.Kernel.OnWait4 = func(cpu *i386.CPU, pid int32, statusAddr, options uint32) int32 {
 		return s.wait4(p, cpu, pid, statusAddr, options)
 	}
@@ -54,6 +58,33 @@ func (s *Scheduler) fork(parentPID int32) (int32, error) {
 	pid := s.nextPID
 	s.nextPID++
 	child := parentTask.Process.CloneForFork(pid)
+	s.tasks[pid] = &Task{Process: child}
+	s.order = append(s.order, pid)
+	s.wire(child)
+	return pid, nil
+}
+
+func (s *Scheduler) clone(parentPID int32, parentCPU *i386.CPU, flags, childStack, parentTID, childTID, tls uint32) (int32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	parentTask, ok := s.tasks[parentPID]
+	if !ok || parentTask.Process.State == Exited {
+		return 0, fmt.Errorf("clone: parent %d is not runnable", parentPID)
+	}
+	pid := s.nextPID
+	s.nextPID++
+	child := parentTask.Process.CloneForThread(pid, childStack, tls)
+	child.ParentPID = parentPID
+	if flags&kernel.CloneParentSettid != 0 && parentTID != 0 {
+		if err := parentCPU.Mem.Write32(parentTID, uint32(pid)); err != nil {
+			return 0, err
+		}
+	}
+	if flags&kernel.CloneChildSettid != 0 && childTID != 0 {
+		if err := child.Image.CPU.Mem.Write32(childTID, uint32(pid)); err != nil {
+			return 0, err
+		}
+	}
 	s.tasks[pid] = &Task{Process: child}
 	s.order = append(s.order, pid)
 	s.wire(child)

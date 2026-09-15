@@ -384,6 +384,37 @@ func TestCloneForkStyleAndSharedThreadRejection(t *testing.T) {
 	}
 }
 
+func TestCloneSharedForwardsI386Arguments(t *testing.T) {
+	mem := i386.NewMemory(4096)
+	cpu := i386.NewCPU(mem)
+	fs, err := vfs.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := New(fs, pty.New())
+	var got [5]uint32
+	k.OnClone = func(_ *i386.CPU, flags, stack, parentTID, childTID, tls uint32) (int32, error) {
+		got = [5]uint32{flags, stack, parentTID, childTID, tls}
+		return 77, nil
+	}
+	cpu.Regs[i386.EAX] = SysClone
+	cpu.Regs[i386.EBX] = CloneVM | CloneThread | 17
+	cpu.Regs[i386.ECX] = 0x2000
+	cpu.Regs[i386.EDX] = 0x300
+	cpu.Regs[i386.ESI] = 0x400
+	cpu.Regs[i386.EDI] = 0x500
+	if err := k.Handle(cpu); err != nil {
+		t.Fatal(err)
+	}
+	if int32(cpu.Regs[i386.EAX]) != 77 {
+		t.Fatalf("clone result=%d", int32(cpu.Regs[i386.EAX]))
+	}
+	want := [5]uint32{CloneVM | CloneThread | 17, 0x2000, 0x300, 0x500, 0x400}
+	if got != want {
+		t.Fatalf("clone args=%#v want %#v", got, want)
+	}
+}
+
 func TestSignalActionsMasksAndKillValidation(t *testing.T) {
 	mem := i386.NewMemory(4096)
 	cpu := i386.NewCPU(mem)
