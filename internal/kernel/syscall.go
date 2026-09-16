@@ -2,7 +2,6 @@ package kernel
 
 import (
 	"context"
-	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,6 +14,11 @@ import (
 	"time"
 
 	"example.com/ish-go/internal/i386"
+	identitysys "example.com/ish-go/internal/kernel/syscalls/identity"
+	processsys "example.com/ish-go/internal/kernel/syscalls/process"
+	randomsys "example.com/ish-go/internal/kernel/syscalls/random"
+	systemsys "example.com/ish-go/internal/kernel/syscalls/system"
+	timesys "example.com/ish-go/internal/kernel/syscalls/time"
 	"example.com/ish-go/internal/pty"
 	"example.com/ish-go/internal/vfs"
 )
@@ -455,9 +459,13 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 			k.ret(cpu, -ErrnoBadFD)
 		}
 	case SysGetpid, SysGetpgrp, SysGetsid, SysGettid, SysGetpgid:
-		k.ret(cpu, k.PID)
+		processsys.GetPID(k.PID, cpu)
 	case SysSysinfo:
-		k.sysinfo(cpu, arg(i386.EBX))
+		if !systemsys.Sysinfo(arg(i386.EBX), processStart, cpu) {
+			k.ret(cpu, -ErrnoFault)
+		} else {
+			k.ret(cpu, 0)
+		}
 	case SysKill:
 		k.kill(cpu, int32(arg(i386.EBX)), arg(i386.ECX))
 	case SysSigprocmask:
@@ -466,9 +474,9 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 		k.sigprocmask(cpu, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX), arg(i386.ESI), true)
 
 	case SysSetpgid:
-		k.ret(cpu, 0)
+		processsys.SetPGID(cpu)
 	case SysSetsid:
-		k.ret(cpu, k.PID)
+		processsys.SetSID(k.PID, cpu)
 	case SysIoctl:
 		k.ioctl(cpu, int(arg(i386.EBX)), arg(i386.ECX), arg(i386.EDX))
 	case SysFcntl, SysFcntl64:
@@ -480,8 +488,7 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 	case SysSetThreadArea:
 		k.setThreadArea(cpu, arg(i386.EBX))
 	case SysSetTidAddress:
-		k.TidAddress = arg(i386.EBX)
-		k.ret(cpu, k.PID)
+		identitysys.SetTIDAddress(&k.TidAddress, arg(i386.EBX), k.PID, cpu)
 	case SysRtSigaction:
 		k.rtSigaction(cpu, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX), arg(i386.ESI))
 	case SysRtSigreturn:
@@ -490,7 +497,7 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 		}
 
 	case SysGetuid32, SysGetgid32, SysGeteuid32, SysGetegid32:
-		k.ret(cpu, 0)
+		identitysys.GetID(cpu)
 	case SysGetgroups:
 		k.getgroups(cpu, arg(i386.EBX), arg(i386.ECX))
 	case SysSetgroups:
@@ -531,13 +538,29 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 	case SysGetcwd:
 		k.getcwd(cpu, arg(i386.EBX), arg(i386.ECX))
 	case SysUname:
-		k.uname(cpu, arg(i386.EBX))
+		if !systemsys.Uname(arg(i386.EBX), cpu) {
+			k.ret(cpu, -ErrnoFault)
+		} else {
+			k.ret(cpu, 0)
+		}
 	case SysGettimeofday:
-		k.gettimeofday(cpu, arg(i386.EBX))
+		if arg(i386.EBX) == 0 || !timesys.Gettimeofday(arg(i386.EBX), cpu) {
+			k.ret(cpu, -ErrnoFault)
+		} else {
+			k.ret(cpu, 0)
+		}
 	case SysClockGettime:
-		k.clockGettime(cpu, arg(i386.EBX), arg(i386.ECX))
+		if !timesys.ClockGettime(arg(i386.EBX), arg(i386.ECX), processStart, cpu) {
+			k.ret(cpu, -ErrnoFault)
+		} else {
+			k.ret(cpu, 0)
+		}
 	case SysGetrandom:
-		k.getrandom(cpu, arg(i386.EBX), arg(i386.ECX))
+		if n, ok := randomsys.Getrandom(arg(i386.EBX), arg(i386.ECX), cpu); ok {
+			k.ret(cpu, int32(n))
+		} else {
+			k.ret(cpu, -ErrnoFault)
+		}
 	case SysReadlink:
 		k.readlink(cpu, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX))
 	case SysGetdents64:
@@ -609,25 +632,6 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 		k.OnSyscallDone(n, cpu)
 	}
 	return nil
-}
-
-func (k *Kernel) sysinfo(cpu *i386.CPU, addr uint32) {
-	const size = 64
-	buf := make([]byte, size)
-	uptime := uint32(time.Since(processStart).Seconds())
-	binary.LittleEndian.PutUint32(buf[0:], uptime)
-	mem := cpu.Mem.Size()
-	binary.LittleEndian.PutUint32(buf[16:], mem)
-	binary.LittleEndian.PutUint32(buf[20:], mem/2)
-	binary.LittleEndian.PutUint16(buf[40:], 1)
-	binary.LittleEndian.PutUint32(buf[44:], 0)
-	binary.LittleEndian.PutUint32(buf[48:], 0)
-	binary.LittleEndian.PutUint32(buf[52:], 1) // mem_unit
-	if err := cpu.Mem.WriteBytes(addr, buf); err != nil {
-		k.ret(cpu, -ErrnoFault)
-		return
-	}
-	k.ret(cpu, 0)
 }
 
 // TakePendingSignal removes one unblocked pending signal for Process.Step.
@@ -1597,18 +1601,6 @@ func (k *Kernel) getcwd(cpu *i386.CPU, addr, size uint32) {
 	}
 }
 
-func (k *Kernel) uname(cpu *i386.CPU, addr uint32) {
-	name := make([]byte, 390)
-	for i, field := range []string{"Linux", "ish-go", "6.1.0-go", "#1", "i386", ""} {
-		copy(name[i*65:i*65+65], field)
-	}
-	if cpu.Mem.WriteBytes(addr, name) != nil {
-		k.ret(cpu, -ErrnoFault)
-	} else {
-		k.ret(cpu, 0)
-	}
-}
-
 func (k *Kernel) getdents64(cpu *i386.CPU, fd int, addr, count uint32) {
 	f, ok := k.fds[fd]
 	if !ok {
@@ -1890,56 +1882,6 @@ func (k *Kernel) ioctl(cpu *i386.CPU, fd int, request, arg uint32) {
 		}
 	}
 	k.ret(cpu, 0)
-}
-
-func (k *Kernel) gettimeofday(cpu *i386.CPU, addr uint32) {
-	if addr == 0 {
-		k.ret(cpu, 0)
-		return
-	}
-	now := time.Now()
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint32(buf[0:], uint32(now.Unix()))
-	binary.LittleEndian.PutUint32(buf[4:], uint32(now.Nanosecond()/1000))
-	if cpu.Mem.WriteBytes(addr, buf) != nil {
-		k.ret(cpu, -ErrnoFault)
-		return
-	}
-	k.ret(cpu, 0)
-}
-
-func (k *Kernel) clockGettime(cpu *i386.CPU, clockID, addr uint32) {
-	if addr == 0 {
-		k.ret(cpu, -ErrnoFault)
-		return
-	}
-	now := time.Now()
-	buf := make([]byte, 8)
-	if clockID == 1 { // CLOCK_MONOTONIC
-		d := time.Since(processStart)
-		binary.LittleEndian.PutUint32(buf[0:], uint32(d/time.Second))
-		binary.LittleEndian.PutUint32(buf[4:], uint32(d%time.Second))
-	} else {
-		binary.LittleEndian.PutUint32(buf[0:], uint32(now.Unix()))
-		binary.LittleEndian.PutUint32(buf[4:], uint32(now.Nanosecond()))
-	}
-	if cpu.Mem.WriteBytes(addr, buf) != nil {
-		k.ret(cpu, -ErrnoFault)
-		return
-	}
-	k.ret(cpu, 0)
-}
-
-func (k *Kernel) getrandom(cpu *i386.CPU, addr, length uint32) {
-	if length > 1<<20 {
-		length = 1 << 20
-	}
-	data := make([]byte, length)
-	if _, err := cryptorand.Read(data); err != nil || cpu.Mem.WriteBytes(addr, data) != nil {
-		k.ret(cpu, -ErrnoFault)
-		return
-	}
-	k.ret(cpu, int32(length))
 }
 
 func (k *Kernel) readlink(cpu *i386.CPU, pathAddr, bufAddr, size uint32) {
