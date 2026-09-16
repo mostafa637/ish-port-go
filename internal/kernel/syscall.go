@@ -15,6 +15,7 @@ import (
 
 	"example.com/ish-go/internal/i386"
 	identitysys "example.com/ish-go/internal/kernel/syscalls/identity"
+	memorysys "example.com/ish-go/internal/kernel/syscalls/memory"
 	processsys "example.com/ish-go/internal/kernel/syscalls/process"
 	randomsys "example.com/ish-go/internal/kernel/syscalls/random"
 	systemsys "example.com/ish-go/internal/kernel/syscalls/system"
@@ -486,7 +487,7 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 	case SysFstat64:
 		k.statFD(cpu, int(arg(i386.EBX)), arg(i386.ECX))
 	case SysSetThreadArea:
-		k.setThreadArea(cpu, arg(i386.EBX))
+		k.ret(cpu, identitysys.SetThreadArea(arg(i386.EBX), cpu))
 	case SysSetTidAddress:
 		identitysys.SetTIDAddress(&k.TidAddress, arg(i386.EBX), k.PID, cpu)
 	case SysRtSigaction:
@@ -499,9 +500,9 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 	case SysGetuid32, SysGetgid32, SysGeteuid32, SysGetegid32:
 		identitysys.GetID(cpu)
 	case SysGetgroups:
-		k.getgroups(cpu, arg(i386.EBX), arg(i386.ECX))
+		k.ret(cpu, identitysys.GetGroups(arg(i386.EBX), arg(i386.ECX), cpu))
 	case SysSetgroups:
-		k.setgroups(cpu, arg(i386.EBX), arg(i386.ECX))
+		k.ret(cpu, identitysys.SetGroups(arg(i386.EBX), arg(i386.ECX), cpu))
 	case SysBrk:
 		requested := arg(i386.EBX)
 		if requested == 0 {
@@ -620,9 +621,9 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 	case SysStatfs64:
 		k.statfs64(cpu, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX))
 	case SysMunmap:
-		k.munmap(cpu, arg(i386.EBX), arg(i386.ECX))
+		k.ret(cpu, memorysys.Munmap(k.Space, arg(i386.EBX), arg(i386.ECX)))
 	case SysMprotect:
-		k.mprotect(cpu, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX))
+		k.ret(cpu, memorysys.Mprotect(k.Space, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX)))
 	case SysMremap:
 		k.mremap(cpu, arg(i386.EBX), arg(i386.ECX), arg(i386.EDX), arg(i386.ESI), arg(i386.EDI))
 	default:
@@ -1030,50 +1031,6 @@ func (k *Kernel) poll(cpu *i386.CPU, fdsAddr, nfds uint32, timeout int32) {
 	}
 	ready, _ := check()
 	k.ret(cpu, ready)
-}
-
-func (k *Kernel) getgroups(cpu *i386.CPU, size, listAddr uint32) {
-	// The sandboxed guest runs as uid/gid 0 and has one supplementary group.
-	// Match Linux getgroups(0, NULL) by reporting the count without touching
-	// the list, and validate the destination for the non-zero form.
-	const groupCount = 1
-	if size == 0 {
-		k.ret(cpu, groupCount)
-		return
-	}
-	if size < groupCount {
-		k.ret(cpu, -ErrnoInvalid)
-		return
-	}
-	if cpu.Mem.Write32(listAddr, 0) != nil {
-		k.ret(cpu, -ErrnoFault)
-		return
-	}
-	k.ret(cpu, groupCount)
-}
-
-func (k *Kernel) setgroups(cpu *i386.CPU, size, listAddr uint32) {
-	if size > 1<<16 {
-		k.ret(cpu, -ErrnoInvalid)
-		return
-	}
-	if size > 0 {
-		if _, err := cpu.Mem.ReadBytes(listAddr, size*4); err != nil {
-			k.ret(cpu, -ErrnoFault)
-			return
-		}
-	}
-	k.ret(cpu, 0)
-}
-
-func (k *Kernel) setThreadArea(cpu *i386.CPU, descAddr uint32) {
-	base, err := cpu.Mem.Read32(descAddr + 4)
-	if err != nil {
-		k.ret(cpu, -ErrnoFault)
-		return
-	}
-	cpu.GSBase = base
-	k.ret(cpu, 0)
 }
 
 func (k *Kernel) handleRead(cpu *i386.CPU, fd int, addr, count uint32) {
@@ -2161,53 +2118,9 @@ func (k *Kernel) mmap2(cpu *i386.CPU, addr, length, linuxProt, flags uint32, fd 
 	k.ret(cpu, int32(mapped))
 }
 
-func pageAlignLength(length uint32) (uint32, bool) {
-	if length == 0 || length > ^uint32(0)-4094 {
-		return 0, false
-	}
-	return (length + 4095) &^ 4095, true
-}
-
-func (k *Kernel) munmap(cpu *i386.CPU, addr, length uint32) {
-	aligned, ok := pageAlignLength(length)
-	if k.Space == nil || !ok || addr&0xfff != 0 {
-		k.ret(cpu, -ErrnoInvalid)
-		return
-	}
-	if err := k.Space.Remove(addr, aligned); err != nil {
-		k.ret(cpu, -ErrnoInvalid)
-		return
-	}
-	k.ret(cpu, 0)
-}
-
-func (k *Kernel) mprotect(cpu *i386.CPU, addr, length, linuxProt uint32) {
-	aligned, ok := pageAlignLength(length)
-	if k.Space == nil || !ok || addr&0xfff != 0 {
-		k.ret(cpu, -ErrnoInvalid)
-		return
-	}
-	prot := uint8(0)
-	if linuxProt&1 != 0 {
-		prot |= i386.ProtRead
-	}
-	if linuxProt&2 != 0 {
-		prot |= i386.ProtWrite
-	}
-	if linuxProt&4 != 0 {
-		prot |= i386.ProtExec
-	}
-	length = aligned
-	if err := k.Space.Protect(addr, length, prot); err != nil {
-		k.ret(cpu, -ErrnoInvalid)
-		return
-	}
-	k.ret(cpu, 0)
-}
-
 func (k *Kernel) mremap(cpu *i386.CPU, oldAddr, oldLength, newLength, flags, newAddr uint32) {
-	oldSize, oldOK := pageAlignLength(oldLength)
-	newSize, newOK := pageAlignLength(newLength)
+	oldSize, oldOK := memorysys.PageLength(oldLength)
+	newSize, newOK := memorysys.PageLength(newLength)
 	if k.Space == nil || !oldOK || !newOK || oldAddr&0xfff != 0 || oldAddr > k.Space.Max || oldSize > k.Space.Max-oldAddr {
 		k.ret(cpu, -ErrnoInvalid)
 		return
