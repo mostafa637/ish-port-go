@@ -15,6 +15,7 @@ import (
 
 	"example.com/ish-go/internal/i386"
 	identitysys "example.com/ish-go/internal/kernel/syscalls/identity"
+	iosys "example.com/ish-go/internal/kernel/syscalls/io"
 	memorysys "example.com/ish-go/internal/kernel/syscalls/memory"
 	processsys "example.com/ish-go/internal/kernel/syscalls/process"
 	randomsys "example.com/ish-go/internal/kernel/syscalls/random"
@@ -442,23 +443,14 @@ func (k *Kernel) Handle(cpu *i386.CPU) error {
 	case SysRename:
 		k.rename(cpu, arg(i386.EBX), arg(i386.ECX))
 	case SysDup2:
-		k.dup(cpu, int(arg(i386.EBX)), int(arg(i386.ECX)), 0, false)
+		oldFD, newFD := int(arg(i386.EBX)), int(arg(i386.ECX))
+		k.ret(cpu, iosys.Dup(oldFD, newFD, 0, false, k.validFD, k.dupInstall))
 	case SysDup3:
-		k.dup(cpu, int(arg(i386.EBX)), int(arg(i386.ECX)), arg(i386.EDX), true)
+		oldFD, newFD := int(arg(i386.EBX)), int(arg(i386.ECX))
+		k.ret(cpu, iosys.Dup(oldFD, newFD, arg(i386.EDX), true, k.validFD, k.dupInstall))
 	case SysClose:
 		fd := int(arg(i386.EBX))
-		if f, ok := k.fds[fd]; ok {
-			_ = f.Close()
-			delete(k.fds, fd)
-			delete(k.closedFDs, fd)
-			delete(k.fdCloexec, fd)
-			k.ret(cpu, 0)
-		} else if fd >= 0 && fd <= 2 && k.TTY != nil && !k.closedFDs[fd] {
-			k.closedFDs[fd] = true
-			k.ret(cpu, 0)
-		} else {
-			k.ret(cpu, -ErrnoBadFD)
-		}
+		k.ret(cpu, iosys.Close(fd, k.closeDescriptor, k.closeTTY))
 	case SysGetpid, SysGetpgrp, SysGetsid, SysGettid, SysGetpgid:
 		processsys.GetPID(k.PID, cpu)
 	case SysSysinfo:
@@ -1632,39 +1624,6 @@ func SyscallName(number uint32) string {
 		return name
 	}
 	return "sys_" + strings.TrimSpace(fmt.Sprint(number))
-}
-
-func (k *Kernel) dup(cpu *i386.CPU, oldFD, newFD int, flags uint32, isDup3 bool) {
-	if newFD < 0 || oldFD < 0 || (flags != 0 && flags != 0x80000) {
-		k.ret(cpu, -ErrnoInvalid)
-		return
-	}
-	handle, ok := k.handleForFD(oldFD)
-	if oldFD == newFD {
-		if !isDup3 && ok {
-			k.ret(cpu, int32(newFD))
-		} else {
-			k.ret(cpu, -ErrnoInvalid)
-		}
-		return
-	}
-	if !ok {
-		k.ret(cpu, -ErrnoBadFD)
-		return
-	}
-	if old, exists := k.fds[newFD]; exists && old != handle {
-		_ = old.Close()
-	}
-	k.fds[newFD] = cloneHandle(handle)
-	delete(k.closedFDs, newFD)
-	delete(k.fdCloexec, newFD)
-	if isDup3 && flags&0x80000 != 0 {
-		k.fdCloexec[newFD] = true
-	}
-	if newFD >= k.nextFD {
-		k.nextFD = newFD + 1
-	}
-	k.ret(cpu, int32(newFD))
 }
 
 func (k *Kernel) fcntl(cpu *i386.CPU, fd, command int, argument uint32) {
